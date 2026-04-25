@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <ItemGroup>
+    <ProjectReference Include="..\Kgs.Game.Contracts\Kgs.Game.Contracts.csproj" />
+    <ProjectReference Include="..\Kgs.Server.Transport\Kgs.Server.Transport.csproj" />
+  </ItemGroup>
+</Project>
