@@ -86,10 +86,10 @@ public sealed class GameSession : ISessionSender
     {
         while (!_isClosing && (_webSocket.State is WebSocketState.Open or WebSocketState.CloseReceived))
         {
-            WebSocketFrame? frame;
+            PooledWebSocketFrame? frameResult;
             try
             {
-                frame = await ReceiveFrameAsync(GetReceiveDeadline(), cancellationToken);
+                frameResult = await ReceiveFrameAsync(GetReceiveDeadline(), cancellationToken);
             }
             catch (TimeoutException)
             {
@@ -100,11 +100,23 @@ public sealed class GameSession : ISessionSender
                 await CloseWithErrorAsync(errorCode, 0, message);
                 return;
             }
+            catch (FrameTooLargeException ex)
+            {
+                await CloseWithErrorAsync(ProtocolErrorCode.PayloadTooLarge, 0, ex.Message);
+                return;
+            }
+            catch (UnsupportedFrameTypeException ex)
+            {
+                await CloseWithErrorAsync(ProtocolErrorCode.InvalidPacket, 0, ex.Message);
+                return;
+            }
 
-            if (frame is null)
+            if (frameResult is null)
             {
                 return;
             }
+
+            using var frame = frameResult.Value;
 
             if (frame.MessageType is not WebSocketMessageType.Binary)
             {
@@ -208,12 +220,21 @@ public sealed class GameSession : ISessionSender
                     return;
                 }
 
-                var payload = PacketCodec.Encode(packet, _options.MaxPayloadLength);
-                await _webSocket.SendAsync(
-                    payload,
-                    WebSocketMessageType.Binary,
-                    endOfMessage: true,
-                    cancellationToken);
+                var encodedLength = PacketCodec.GetEncodedLength(packet, _options.MaxPayloadLength);
+                var buffer = ArrayPool<byte>.Shared.Rent(encodedLength);
+                try
+                {
+                    var written = PacketCodec.EncodeTo(packet, buffer, _options.MaxPayloadLength);
+                    await _webSocket.SendAsync(
+                        buffer.AsMemory(0, written),
+                        WebSocketMessageType.Binary,
+                        endOfMessage: true,
+                        cancellationToken);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -223,9 +244,14 @@ public sealed class GameSession : ISessionSender
         {
             _logger.LogDebug(ex, "Send loop failed for session {SessionId}.", SessionId);
         }
+        catch (Exception ex)
+        {
+            _isClosing = true;
+            _logger.LogError(ex, "Send loop failed unexpectedly for session {SessionId}.", SessionId);
+        }
     }
 
-    private async Task<WebSocketFrame?> ReceiveFrameAsync(DateTimeOffset deadline, CancellationToken cancellationToken)
+    private async Task<PooledWebSocketFrame?> ReceiveFrameAsync(DateTimeOffset deadline, CancellationToken cancellationToken)
     {
         var remaining = deadline - DateTimeOffset.UtcNow;
         if (remaining <= TimeSpan.Zero)
@@ -246,11 +272,13 @@ public sealed class GameSession : ISessionSender
         }
     }
 
-    private async Task<WebSocketFrame?> ReceiveFrameCoreAsync(CancellationToken cancellationToken)
+    private async Task<PooledWebSocketFrame?> ReceiveFrameCoreAsync(CancellationToken cancellationToken)
     {
         var buffer = ArrayPool<byte>.Shared.Rent(ReceiveBufferSize);
-        MemoryStream? fragmentedMessage = null;
+        var returnBuffer = true;
+        PooledFrameBuffer? fragmentedMessage = null;
         WebSocketMessageType? messageType = null;
+        var maxFrameLength = GetMaxFrameLength();
 
         try
         {
@@ -266,22 +294,59 @@ public sealed class GameSession : ISessionSender
                 }
 
                 messageType ??= result.MessageType;
-                fragmentedMessage ??= new MemoryStream();
-                fragmentedMessage.Write(buffer, 0, result.Count);
+
+                if (messageType.Value is not WebSocketMessageType.Binary)
+                {
+                    throw new UnsupportedFrameTypeException(messageType.Value);
+                }
+
+                if (result.Count > maxFrameLength)
+                {
+                    throw new FrameTooLargeException(maxFrameLength);
+                }
+
+                if (fragmentedMessage is null && result.EndOfMessage)
+                {
+                    returnBuffer = false;
+                    return new PooledWebSocketFrame(
+                        messageType.Value,
+                        buffer,
+                        result.Count,
+                        returnToPool: true);
+                }
+
+                fragmentedMessage ??= new PooledFrameBuffer(
+                    Math.Min(ReceiveBufferSize, maxFrameLength),
+                    maxFrameLength);
+
+                if (fragmentedMessage.Count > maxFrameLength - result.Count)
+                {
+                    throw new FrameTooLargeException(maxFrameLength);
+                }
+
+                fragmentedMessage.Append(buffer.AsSpan(0, result.Count));
 
                 if (!result.EndOfMessage)
                 {
                     continue;
                 }
 
-                return new WebSocketFrame(messageType.Value, fragmentedMessage.ToArray());
+                return fragmentedMessage.Detach(messageType.Value);
             }
         }
         finally
         {
             fragmentedMessage?.Dispose();
-            ArrayPool<byte>.Shared.Return(buffer);
+            if (returnBuffer)
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
         }
+    }
+
+    private int GetMaxFrameLength()
+    {
+        return checked(PacketCodec.HeaderSize + _options.MaxPayloadLength);
     }
 
     private DateTimeOffset GetReceiveDeadline()
@@ -298,18 +363,18 @@ public sealed class GameSession : ISessionSender
 
     private async Task CloseWithErrorAsync(ProtocolErrorCode errorCode, uint requestId, string message)
     {
-        try
+        var errorPacket = ProtocolErrorPackets.Create(errorCode, requestId, message, _options.MaxPayloadLength);
+        if (!_outbound.Writer.TryWrite(errorPacket))
         {
-            await EnqueueAsync(ProtocolErrorPackets.Create(errorCode, requestId, message), CancellationToken.None);
+            _logger.LogDebug(
+                "Could not enqueue error packet {ErrorCode} for session {SessionId}; closing without error response.",
+                errorCode,
+                SessionId);
         }
-        catch (ChannelClosedException)
-        {
-        }
-        finally
-        {
-            _isClosing = true;
-            _outbound.Writer.TryComplete();
-        }
+
+        _isClosing = true;
+        _outbound.Writer.TryComplete();
+        await Task.CompletedTask;
     }
 
     private static async Task WaitForSendLoopAsync(Task sendLoop)
@@ -334,7 +399,94 @@ public sealed class GameSession : ISessionSender
         }
     }
 
-    private sealed record WebSocketFrame(
-        WebSocketMessageType MessageType,
-        ReadOnlyMemory<byte> Payload);
+    private readonly struct PooledWebSocketFrame(
+        WebSocketMessageType messageType,
+        byte[] buffer,
+        int count,
+        bool returnToPool) : IDisposable
+    {
+        private readonly byte[] _buffer = buffer;
+        private readonly int _count = count;
+        private readonly bool _returnToPool = returnToPool;
+
+        public WebSocketMessageType MessageType { get; } = messageType;
+
+        public ReadOnlyMemory<byte> Payload => _buffer.AsMemory(0, _count);
+
+        public void Dispose()
+        {
+            if (_returnToPool)
+            {
+                ArrayPool<byte>.Shared.Return(_buffer);
+            }
+        }
+    }
+
+    private sealed class PooledFrameBuffer(int initialCapacity, int maxCapacity) : IDisposable
+    {
+        private byte[]? _buffer = ArrayPool<byte>.Shared.Rent(initialCapacity);
+        private int _count;
+
+        public int Count => _count;
+
+        public void Append(ReadOnlySpan<byte> source)
+        {
+            EnsureCapacity(_count + source.Length);
+            source.CopyTo(_buffer.AsSpan(_count));
+            _count += source.Length;
+        }
+
+        public PooledWebSocketFrame Detach(WebSocketMessageType messageType)
+        {
+            var buffer = _buffer ?? throw new ObjectDisposedException(nameof(PooledFrameBuffer));
+            _buffer = null;
+            return new PooledWebSocketFrame(
+                messageType,
+                buffer,
+                _count,
+                returnToPool: true);
+        }
+
+        public void Dispose()
+        {
+            if (_buffer is not null)
+            {
+                ArrayPool<byte>.Shared.Return(_buffer);
+                _buffer = null;
+            }
+        }
+
+        private void EnsureCapacity(int requiredLength)
+        {
+            if (requiredLength > maxCapacity)
+            {
+                throw new FrameTooLargeException(maxCapacity);
+            }
+
+            var buffer = _buffer ?? throw new ObjectDisposedException(nameof(PooledFrameBuffer));
+            if (buffer.Length >= requiredLength)
+            {
+                return;
+            }
+
+            var newLength = buffer.Length;
+            while (newLength < requiredLength)
+            {
+                newLength = newLength > maxCapacity / 2
+                    ? maxCapacity
+                    : Math.Min(newLength * 2, maxCapacity);
+            }
+
+            var newBuffer = ArrayPool<byte>.Shared.Rent(newLength);
+            buffer.AsSpan(0, _count).CopyTo(newBuffer);
+            ArrayPool<byte>.Shared.Return(buffer);
+            _buffer = newBuffer;
+        }
+    }
+
+    private sealed class FrameTooLargeException(int maxFrameLength)
+        : Exception($"WebSocket frame exceeds the maximum allowed length of {maxFrameLength} bytes.");
+
+    private sealed class UnsupportedFrameTypeException(WebSocketMessageType messageType)
+        : Exception($"Only binary WebSocket frames are supported. Received: {messageType}.");
 }

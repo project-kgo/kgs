@@ -7,5 +7,6 @@ public enum ProtocolErrorCode : ushort
     RateLimited = 3,
     ServerBusy = 4,
     HeartbeatTimeout = 5,
-    DispatchFailed = 6
+    DispatchFailed = 6,
+    PayloadTooLarge = 7
 }

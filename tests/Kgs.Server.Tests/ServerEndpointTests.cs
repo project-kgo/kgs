@@ -2,6 +2,7 @@ using System.Net.WebSockets;
 using System.Net;
 using FluentAssertions;
 using Kgs.Game.Contracts;
+using Kgs.Server.Transport.Configuration;
 using Kgs.Server.Transport.Packets;
 using Kgs.Server.Transport.Sessions;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -12,14 +13,9 @@ using Xunit;
 
 namespace Kgs.Server.Tests;
 
-public sealed class ServerEndpointTests : IClassFixture<WebApplicationFactory<Program>>
+public sealed class ServerEndpointTests(WebApplicationFactory<Program> factory) : IClassFixture<WebApplicationFactory<Program>>
 {
-    private readonly WebApplicationFactory<Program> _factory;
-
-    public ServerEndpointTests(WebApplicationFactory<Program> factory)
-    {
-        _factory = factory;
-    }
+    private readonly WebApplicationFactory<Program> _factory = factory;
 
     [Fact]
     public async Task Healthz_returns_healthy_response()
@@ -108,10 +104,109 @@ public sealed class ServerEndpointTests : IClassFixture<WebApplicationFactory<Pr
         await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "test complete", CancellationToken.None);
     }
 
+    [Fact]
+    public async Task Ws_dispatches_fragmented_authenticated_binary_packets()
+    {
+        var dispatcher = new RecordingGameMessageDispatcher();
+        using var factory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                services.RemoveAll<IPacketDispatcher>();
+                services.AddSingleton<IPacketDispatcher>(dispatcher);
+            });
+        });
+        using var socket = await factory.Server.CreateWebSocketClient()
+            .ConnectAsync(new Uri("ws://localhost/ws"), CancellationToken.None);
+
+        await SendPacketAsync(socket, new GamePacket(SystemOpCodes.AuthRequest, 1, 0, "dev-token"u8.ToArray()));
+        _ = await ReceivePacketAsync(socket);
+        await SendPacketFragmentedAsync(socket, new GamePacket(1001, 21, 0, "fragmented-move"u8.ToArray()));
+
+        await WaitUntilAsync(() => dispatcher.Requests.Count == 1);
+        dispatcher.Requests[0].Packet.OpCode.Should().Be(1001);
+        dispatcher.Requests[0].Packet.Payload.ToArray().Should().Equal("fragmented-move"u8.ToArray());
+
+        await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "test complete", CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Ws_rejects_text_websocket_messages()
+    {
+        using var socket = await _factory.Server.CreateWebSocketClient()
+            .ConnectAsync(new Uri("ws://localhost/ws"), CancellationToken.None);
+
+        await socket.SendAsync(
+            "hello"u8.ToArray(),
+            WebSocketMessageType.Text,
+            endOfMessage: true,
+            CancellationToken.None);
+        var response = await ReceivePacketAsync(socket);
+
+        response.OpCode.Should().Be(SystemOpCodes.Error);
+        response.Flags.Should().Be((ushort)ProtocolErrorCode.InvalidPacket);
+    }
+
+    [Fact]
+    public async Task Ws_rejects_fragmented_text_websocket_messages_without_waiting_for_all_fragments()
+    {
+        using var socket = await _factory.Server.CreateWebSocketClient()
+            .ConnectAsync(new Uri("ws://localhost/ws"), CancellationToken.None);
+
+        await socket.SendAsync(
+            "hello"u8.ToArray(),
+            WebSocketMessageType.Text,
+            endOfMessage: false,
+            CancellationToken.None);
+        var response = await ReceivePacketAsync(socket);
+
+        response.OpCode.Should().Be(SystemOpCodes.Error);
+        response.Flags.Should().Be((ushort)ProtocolErrorCode.InvalidPacket);
+    }
+
+    [Fact]
+    public async Task Ws_rejects_fragmented_messages_that_exceed_max_payload_length()
+    {
+        using var factory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                services.Configure<SessionOptions>(options =>
+                {
+                    options.MaxPayloadLength = 8;
+                });
+            });
+        });
+        using var socket = await factory.Server.CreateWebSocketClient()
+            .ConnectAsync(new Uri("ws://localhost/ws"), CancellationToken.None);
+
+        await SendPacketFragmentedAsync(socket, new GamePacket(SystemOpCodes.AuthRequest, 1, 0, "too-large-token"u8.ToArray()));
+        var response = await ReceivePacketAsync(socket);
+
+        response.OpCode.Should().Be(SystemOpCodes.Error);
+        response.Flags.Should().Be((ushort)ProtocolErrorCode.PayloadTooLarge);
+    }
+
     private static async Task SendPacketAsync(WebSocket socket, GamePacket packet)
     {
         var encoded = PacketCodec.Encode(packet, maxPayloadLength: 64 * 1024);
         await socket.SendAsync(encoded, WebSocketMessageType.Binary, endOfMessage: true, CancellationToken.None);
+    }
+
+    private static async Task SendPacketFragmentedAsync(WebSocket socket, GamePacket packet)
+    {
+        var encoded = PacketCodec.Encode(packet, maxPayloadLength: 64 * 1024);
+        var splitAt = encoded.Length / 2;
+        await socket.SendAsync(
+            encoded.AsMemory(0, splitAt),
+            WebSocketMessageType.Binary,
+            endOfMessage: false,
+            CancellationToken.None);
+        await socket.SendAsync(
+            encoded.AsMemory(splitAt),
+            WebSocketMessageType.Binary,
+            endOfMessage: true,
+            CancellationToken.None);
     }
 
     private static async Task<GamePacket> ReceivePacketAsync(WebSocket socket)
