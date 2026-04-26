@@ -44,3 +44,9 @@ Default protocol opcodes:
 - `5` - error
 
 Business opcodes and routing rules are intentionally application-defined. Replace the default no-op `IPacketDispatcher` in `Kgs.Server` with your own dispatcher, or use `Kgs.Game.Actors` and provide an `IActorPacketRouteResolver` to route packets to Proto.Actor actors.
+
+## Logging
+
+`Kgs.Server` uses Serilog as the host logging pipeline. The default configuration is in `src/Kgs.Server/appsettings.json`, with development overrides in `src/Kgs.Server/appsettings.Development.json`.
+
+Library projects should continue to depend on `Microsoft.Extensions.Logging` abstractions only. Add structured properties such as `SessionId`, `PlayerId`, `OpCode`, and `RequestId` through message templates so host applications can decide how to route and store logs.

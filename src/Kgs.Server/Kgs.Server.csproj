@@ -3,4 +3,9 @@
     <ProjectReference Include="..\Kgs.Game.Contracts\Kgs.Game.Contracts.csproj" />
     <ProjectReference Include="..\Kgs.Server.Transport\Kgs.Server.Transport.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Serilog.AspNetCore" />
+    <PackageReference Include="Serilog.Settings.Configuration" />
+    <PackageReference Include="Serilog.Sinks.Console" />
+  </ItemGroup>
 </Project>
